@@ -1,0 +1,9 @@
+service ibiza_wifi_arranque /system/bin/sh /vendor/bin/ibiza-wifi-arranque.sh
+    user shell
+    group shell inet
+    seclabel u:r:shell:s0
+    disabled
+    oneshot
+
+on property:sys.boot_completed=1
+    start ibiza_wifi_arranque

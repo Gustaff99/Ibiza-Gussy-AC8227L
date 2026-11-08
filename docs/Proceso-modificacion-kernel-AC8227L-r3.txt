@@ -1,0 +1,172 @@
+IBIZA GUSSY | PROCESO DE MODIFICACIÓN DEL KERNEL AC8227L
+Registro técnico de la r3, 6 de noviembre de 2026
+
+1. Plataforma y resultado
+
+   Equipo             Jancar 8227L_demo, AutoChips AC8227L, ARM de 32 bits
+   Firmware           JCAC10003-OC2-V1.1.80R6-251118_0756
+   Kernel de fábrica  Linux 3.18.79+
+   BOOTIMG en la unidad probada  /dev/block/mmcblk0p10, 16 MiB
+   ARM2 en la unidad probada     /dev/block/mmcblk0p9, 4 MiB
+
+La r3 arrancó en esta unidad. Android completó el inicio y ADB volvió por Wi-Fi.
+El kernel recibió ibiza.oc=1391 y reportó 1 391 000 kHz en cpuinfo_cur_freq,
+scaling_cur_freq y scaling_max_freq con el gobernador performance. Antes se
+medían 1 300 000 kHz. El aumento de frecuencia es del 7 %. No se midió una
+mejora equivalente en el tiempo de arranque.
+
+ARM2 r3 arrancó primero con BOOTIMG original. Después se verificó que seguía
+instalado con el BOOT r3. Su funcionamiento con marcha atrás mantenida, la
+imagen del panel físico y la estabilidad prolongada del overclock siguen
+pendientes de ensayo. La reconexión ADB se observó, pero no quedó demostrado
+que la provocara el servicio añadido de Wi-Fi al arranque.
+
+2. Preparar una base reproducible
+
+Identificamos los nombres de partición leyendo /sys/class/block/*/uevent y
+comprobamos sus tamaños. Los números p9 y p10 son propios de esta unidad.
+Copiamos BOOTIMG, RECOVERY y ARM2 y cotejamos los SHA-256 con los del dispositivo.
+Trabajamos sobre copias locales, guardando los originales aparte.
+
+Copias originales y SHA-256:
+   boot-original.img
+   8911ad0e01bf9e229d76eeb5d43ee117e793553192458c69108c144dcd66dc57
+   recovery-original.img
+   c3d74deaf929eddc70f479a35577db5f3ff928f784e14d13e45d943d36eb5731
+   arm2-original.bin
+   679bb2274f50a9d2b99b840003284a9a7063674fd6fecc272d0652b25a6eba14
+
+Probamos a reconstruir el kernel con el árbol público de iscle para AC8227L
+(commit 947d777300b2d6534d947254bc1c550df242e281, Linux 3.18.119). Al importar
+la configuración original, olddefconfig descartó opciones de la plataforma y
+de la cámara. La compilación también encontró cabeceras y archivos ausentes.
+Ese árbol sirvió de referencia para DVFS. La r3 se construyó parcheando el
+binario 3.18.79+ extraído de nuestro BOOTIMG, con sus controladores originales.
+
+Extraímos el zImage, descomprimimos su carga y recuperamos los símbolos de
+kallsyms. Usamos Capstone para seguir las funciones ARM y Unicorn para ejecutar
+fragmentos de código con entradas controladas. Las direcciones virtuales del
+kernel se traducen al archivo descomprimido restando la base 0xC0008000.
+Los offsets de ARM2 indicados aquí empiezan después de su cabecera de 512 bytes.
+
+3. Ejemplo de kernel: frecuencia máxima opcional
+
+El controlador original tenía cinco frecuencias. La tabla del nivel de
+calibración de la unidad empezaba en 1 300 000 kHz y otra rama del mismo
+controlador contenía 1 391 000 kHz a 1 300 mV nominales. En r2 se ensayó
+sustituir directamente la entrada y el límite del nivel 0. En r3 conservamos
+1 300 000 kHz por defecto y elegimos el tope al inicializar el controlador.
+
+   0xC04593AC  Punto de parche en mt_cpufreq_pdrv_probe.
+   0xC09FFF00  Rutina oc_select, en relleno comprobado al final de .text.
+   0xC0E9B014  Puntero a la línea de comandos, localizado vía cmdline_proc_show.
+   0xC0E31028  Primera entrada de frecuencia de la tabla del nivel 0.
+
+El generador sustituye dos instrucciones del punto de parche por BL y NOP.
+La rutina de oc-r3.S lee la línea de comandos y solo activa el cambio con el token completo
+ibiza.oc=1391. Escribe la frecuencia elegida en la primera entrada y devuelve
+el mismo valor al código original para actualizar el límite. Conserva la
+entrada de voltaje y las otras ramas de calibración. El perfil de 1,391 GHz
+usa ese token en la cabecera Android. Los dos perfiles contienen el mismo
+kernel. El gobernador performance ya se configuraba por separado en /vendor.
+
+4. Ejemplo de firmware: traspaso de cámara en ARM2
+
+ARM2 es una partición distinta de BOOTIMG. En la prueba de fábrica, Android
+detectó el TP9950 y solicitó el traspaso alrededor de los 24 s. El registro
+mostró que esperó la respuesta hasta que cambió el estado de marcha atrás.
+El primer experimento sustituyó APP_READY (2) por FORCE_STOP (3) en el kernel.
+El desensamblado del ARM2 confirmó que el 3 fuerza internamente el estado de
+marcha desactivada. La r3 lleva la decisión al propio bucle de ARM2 y deja
+intacto el mensaje normal enviado por Android.
+
+camara-r3.S modifica las ramas de mensajes a partir de 0xF9F0 y engancha el
+bucle de cámara en 0xD294. Mantiene el significado del mensaje 3 explícito.
+Para el traspaso automático espera a que Android esté listo, la marcha atrás
+siga puesta y el estado de señal indique pérdida. Consulta de nuevo al
+decodificador. Solo si la segunda lectura tampoco detecta señal se activa
+la parada. Esta revisión no añade soporte AHD temprano. El caso a validar es
+que Android muestre vídeo sin que el conductor vuelva a engranar la marcha.
+
+5. Generar y verificar las imágenes
+
+Trabajar desde el directorio respaldo-arranque. El generador usa Python
+en Windows y la cadena arm-eabi de GCC 4.8 en WSL Ubuntu. La ruta local
+de herramientas está al principio de crear-r3.py. Para repetir el proceso
+en otro entorno, ajustar esa ruta y registrar las versiones de Python,
+zlib, binutils y Unicorn. El script exige los SHA-256 de las dos copias base.
+
+   python crear-r3.py
+   python crear-r3.py --overclock
+   python probar-r3.py
+   python probar-descompresor-arm.py boot-original.img boot-r3-1300-LAB-NO-FLASHEAR.img boot-r3-1391-LAB-NO-FLASHEAR.img
+
+Reempaquetamos el kernel en un único miembro gzip que ocupa el mismo hueco
+que el de fábrica (offset 0x5158, longitud 6 134 597 bytes). Usamos el campo
+FNAME para ajustar el tamaño sin desplazar los segmentos y recalculamos el
+identificador SHA-1 de la cabecera Android. Conservamos la cabecera MediaTek,
+el ramdisk y el bloque original de 256 bytes al final del contenido alineado.
+Su función no está identificada. El SHA-1 de la cabecera no equivale a una
+firma. El cargador de nuestra unidad aceptó el BOOT r3 de 1,391 GHz.
+
+Las pruebas ejecutan la rutina de descompresión ARM del zImage original y
+comparan los 15 282 176 bytes resultantes. Verifican además el identificador
+Android, la selección del reloj, las respuestas de los mensajes 2 y 3 y
+16 combinaciones del traspaso con las entradas del sensor simuladas.
+
+Archivos r3:
+   boot-r3-1300-LAB-NO-FLASHEAR.img
+   d4757f3c1425cac7e65c72517ca4de3300d77e30fbc19a8910c600214a492840
+   boot-r3-1391-LAB-NO-FLASHEAR.img
+   c5a00efe7ce94dfcdc2b1a0a73bb658ce287b5a6af5cf1704e15b5bda26f388a
+   arm2-camara-condicional-r3-LAB-NO-FLASHEAR.bin
+   74933039931544fd57f86a21f2d3adb1e948b852e5db1f617751e85865e0752a
+
+6. Cómo hicimos la prueba en la unidad
+
+Escribimos primero ARM2 r3 con el BOOT original, verificamos por SHA-256
+leyendo la partición y reiniciamos. Android volvió a ADB y el registro de
+ARM2 mostró el traspaso normal. Después instalamos BOOT r3 a 1,391 GHz y
+verificamos ambas particiones antes de reiniciar de nuevo. Los scripts
+flashear-arm2-r3.sh y flashear-boot-r3-1391.sh son el registro ejecutable de
+esa operación. Validan particiones y huellas, restauran la protección de
+escritura e intentan recuperar el original si falla el cotejo inmediato.
+Ese mecanismo requiere que la unidad siga accesible.
+
+Tras el segundo reinicio, comprobamos que había cambiado boot_id, que
+sys.boot_completed era 1 y que /proc/cmdline incluía ibiza.oc=1391. Leímos
+los valores de cpufreq en /sys/devices/system/cpu/cpu0/cpufreq/ y cotejamos
+los dos SHA-256 instalados. El BOOT r3 de 1,3 GHz se validó en emulación.
+
+7. Qué falta para una versión comunitaria
+
+   - Repetir arranques en frío y tras suspensión. Registrar los tiempos de
+     Android, Wi-Fi y primera imagen de cámara con el firmware base y r3.
+   - Con el coche detenido y asegurado, comprobar marcha atrás mantenida
+     desde el contacto, señal presente y ausente y marcha atrás después
+     del arranque. Buscar pantallas negras, imágenes congeladas y cortes.
+   - Medir temperaturas, frecuencia bajo carga, reducciones térmicas,
+     reinicios y errores con uso prolongado a 1,3 y 1,391 GHz.
+   - Validar una restauración desde fuera de Android para la placa exacta.
+     Documentar el comportamiento del cargador y contrastar más unidades.
+   - Publicar primero el perfil de fábrica como referencia y ofrecer el
+     overclock como opción. Identificar placa, firmware y SHA-256 de base.
+     Preferir parches y un generador reproducible que rechace bases distintas.
+     Antes de distribuir binarios, revisar licencias, permisos y datos del
+     equipo que puedan quedar incrustados en las imágenes.
+
+Material de trabajo
+
+   crear-r3.py, oc-r3.S, camara-r3.S  Generador y código de los parches
+   probar-r3.py, probar-descompresor-arm.py  Pruebas de emulación
+   kallsyms-original.txt, desensamblado-dvfs.txt, desensamblado-backcar.txt
+   kernel-original.config, errores-kernel-base.txt
+   ../camara-arranque-diagnostico.txt  Registro previo al parche
+   estado-flash.md  Bitácora histórica de los experimentos
+
+Referencias de código consultadas durante el trabajo:
+   https://github.com/iscle/android_kernel_autochips_ac8227l/tree/947d777300b2d6534d947254bc1c550df242e281
+   https://github.com/torvalds/linux/blob/v3.18/lib/decompress_inflate.c
+   https://github.com/LibreHU/android_kernel_autochips_ac8257_4.9/blob/LibreHU-main/drivers/misc/autochips/backcar/backcar.c
+   El controlador de LibreHU es de AC8257. Se usó como referencia del
+   protocolo de cámara y se contrastó con el binario de nuestro AC8227L.
